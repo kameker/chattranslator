@@ -110,7 +110,7 @@ public class ConfigScreen extends Screen {
         addLabel("Translation Service:", centerX, y);
 
         // Создаем список значений
-        List<String> services = List.of("mymemory", "libretranslate", "lingva");
+        List<String> services = List.of("mymemory", "libretranslate", "lingva", "yandex");
 
         serviceButton = CycleButton.<String>builder(value ->
                         Component.literal(value)

@@ -1,5 +1,6 @@
 package kameker.chattranslator.translation;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import kameker.chattranslator.config.ModConfig;
@@ -76,20 +77,38 @@ public class TranslationManager {
                     return finalText;
                 }
 
-                // Пробуем MyMemory API
-                String translated = translateWithMyMemory(finalText, detectedSource, finalTargetLang);
+                String translated = null;
+                String service = ModConfig.TRANSLATION_SERVICE.get();
+
+                // Выбираем сервис перевода
+                switch (service) {
+                    case "yandex":
+                        LOGGER.debug("Using Yandex Translate");
+                        translated = translateWithYandex(finalText, detectedSource, finalTargetLang);
+                        break;
+                    case "lingva":
+                        LOGGER.debug("Using Lingva");
+                        translated = translateWithLingva(finalText, finalTargetLang);
+                        break;
+                    case "libretranslate":
+                        LOGGER.debug("Using LibreTranslate");
+                        translated = translateWithLibre(finalText, detectedSource, finalTargetLang);
+                        break;
+                    case "mymemory":
+                        LOGGER.debug("Using MyMemory");
+                        translated = translateWithMyMemory(finalText, detectedSource, finalTargetLang);
+                        break;
+                    default:
+                        LOGGER.debug("Using MyMemory");
+                        translated = translateWithMyMemory(finalText, detectedSource, finalTargetLang);
+                        break;
+                }
 
                 if (translated != null && !translated.equals(finalText) && !isErrorMessage(translated)) {
+                    translated = translated.replace("+", " ");
                     TRANSLATION_CACHE.put(cacheKey, translated);
                     LOGGER.info("Translated [{}->{}]: {} -> {}",
                             detectedSource, finalTargetLang, finalText, translated);
-                    return translated;
-                }
-
-                // Если MyMemory не сработал, пробуем другие API
-                translated = translateWithLingva(finalText, finalTargetLang);
-                if (translated != null && !translated.equals(finalText)) {
-                    TRANSLATION_CACHE.put(cacheKey, translated);
                     return translated;
                 }
 
@@ -113,7 +132,6 @@ public class TranslationManager {
 
     private static String translateWithMyMemory(String text, String sourceLang, String targetLang) {
         try {
-            // MyMemory API - ИСПРАВЛЕНО: правильно кодируем текст
             String encodedText = URLEncoder.encode(text, StandardCharsets.UTF_8);
             String url = String.format(
                     "https://api.mymemory.translated.net/get?q=%s&langpair=%s|%s",
@@ -137,22 +155,16 @@ public class TranslationManager {
             if (response.statusCode() == 200) {
                 JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
 
-                // Логируем ответ для отладки
-                LOGGER.debug("MyMemory response: {}", response.body());
-
                 if (json.has("responseData")) {
                     String translated = json.get("responseData")
                             .getAsJsonObject()
                             .get("translatedText")
                             .getAsString();
 
-                    // Проверяем, что перевод не пустой и не равен оригиналу
                     if (translated != null && !translated.isEmpty() && !translated.equals(text)) {
                         return translated;
                     }
                 }
-            } else {
-                LOGGER.debug("MyMemory HTTP error: {}", response.statusCode());
             }
 
             return null;
@@ -196,6 +208,107 @@ public class TranslationManager {
 
         } catch (Exception e) {
             LOGGER.debug("Lingva request failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private static String translateWithLibre(String text, String sourceLang, String targetLang) {
+        try {
+            JsonObject requestBody = new JsonObject();
+            requestBody.addProperty("q", text);
+            requestBody.addProperty("source", sourceLang);
+            requestBody.addProperty("target", targetLang);
+            requestBody.addProperty("format", "text");
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://libretranslate.com/translate"))
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "Minecraft-Chat-Translator/1.0")
+                    .timeout(java.time.Duration.ofSeconds(5))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
+                    .build();
+
+            HttpResponse<String> response = CLIENT.send(request,
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+                if (json.has("translatedText")) {
+                    return json.get("translatedText").getAsString();
+                }
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            LOGGER.debug("LibreTranslate request failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    // НОВОЕ: Метод для Yandex Translate
+    private static String translateWithYandex(String text, String sourceLang, String targetLang) {
+        try {
+            String apiKey = ModConfig.YANDEX_API_KEY.get();
+            String folderId = ModConfig.YANDEX_FOLDER_ID.get();
+
+            // Проверяем, что ключи есть
+            if (apiKey.isEmpty() || folderId.isEmpty()) {
+                LOGGER.debug("Yandex API key or Folder ID not configured");
+                return null;
+            }
+
+            String url = "https://translate.api.cloud.yandex.net/translate/v2/translate";
+
+            JsonObject requestBody = new JsonObject();
+            requestBody.addProperty("folderId", folderId);
+
+            // Текст для перевода
+            JsonArray texts = new JsonArray();
+            texts.add(text);
+            requestBody.add("texts", texts);
+
+            requestBody.addProperty("targetLanguageCode", targetLang);
+            requestBody.addProperty("sourceLanguageCode", sourceLang);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Api-Key " + apiKey)
+                    .header("User-Agent", "Minecraft-Chat-Translator/1.0")
+                    .timeout(java.time.Duration.ofSeconds(5))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
+                    .build();
+
+            LOGGER.debug("Yandex Translate request for: {}", text);
+
+            HttpResponse<String> response = CLIENT.send(request,
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+
+                if (json.has("translations")) {
+                    String translated = json.get("translations")
+                            .getAsJsonArray()
+                            .get(0)
+                            .getAsJsonObject()
+                            .get("text")
+                            .getAsString();
+
+                    if (translated != null && !translated.isEmpty()) {
+                        LOGGER.debug("Yandex Translate success: {} -> {}", text, translated);
+                        return translated;
+                    }
+                }
+            } else {
+                LOGGER.debug("Yandex API error: {} - {}", response.statusCode(), response.body());
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            LOGGER.debug("Yandex request failed: {}", e.getMessage());
             return null;
         }
     }

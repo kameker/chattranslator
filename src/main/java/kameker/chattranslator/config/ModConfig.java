@@ -29,8 +29,19 @@ public class ModConfig {
     public static final ModConfigSpec.ConfigValue<String> TRANSLATION_SERVICE;
 
     public static final ModConfigSpec SPEC;
+    public static final ModConfigSpec.ConfigValue<String> YANDEX_API_KEY;
+    public static final ModConfigSpec.ConfigValue<String> YANDEX_FOLDER_ID;
+
+// В статическом блоке:
 
     static {
+        YANDEX_API_KEY = BUILDER
+                .comment("AQVNyQFzODCqZaDWjOjPyouWm_bFuZaiybB84dSY")
+                .define("yandexApiKey", "AQVNyQFzODCqZaDWjOjPyouWm_bFuZaiybB84dSY");
+
+        YANDEX_FOLDER_ID = BUILDER
+                .comment("b1g5n4985m621mc6h3vn")
+                .define("yandexFolderId", "b1g5n4985m621mc6h3vn");
         BUILDER.push("General Settings");
 
         ENABLE_TRANSLATION = BUILDER
