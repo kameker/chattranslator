@@ -4,122 +4,240 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import kameker.chattranslator.config.ModConfig;
+import net.minecraft.client.Minecraft;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.regex.Pattern;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 public class TranslationManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(TranslationManager.class);
-    private static final HttpClient CLIENT = HttpClient.newHttpClient();
-    private static final ExecutorService EXECUTOR = Executors.newCachedThreadPool();
+    private static final HttpClient CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
+    private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(4);
 
-    // Кэш переводов
-    private static final Map<String, String> TRANSLATION_CACHE = new ConcurrentHashMap<>();
+    // LRU кэш с ограничением размера
+    private static final int MAX_CACHE_SIZE = 1000;
+    private static final TranslationCache TRANSLATION_CACHE = new TranslationCache(MAX_CACHE_SIZE);
+
+    // Rate limiting
+    private static final Map<String, RateLimiter> RATE_LIMITERS = new ConcurrentHashMap<>();
+    private static final int DEFAULT_RATE_LIMIT = 50; // запросов в минуту
+    private static final int DEEPL_RATE_LIMIT = 20;   // DeepL имеет более строгие лимиты
+
+    // Файл кэша
+    private static final Path CACHE_FILE = Minecraft.getInstance()
+            .gameDirectory.toPath()
+            .resolve("chattranslator_cache.json");
 
     // Поддерживаемые языки и их паттерны для автоопределения
-    private static final Map<String, Pattern> LANGUAGE_PATTERNS = Map.of(
-            "ru", Pattern.compile("[а-яА-ЯёЁ]"),
-            "en", Pattern.compile("[a-zA-Z]"),
-            "da", Pattern.compile("[æøåÆØÅ]"),
-            "es", Pattern.compile("[áéíóúñü¿¡]"),
-            "fr", Pattern.compile("[àâæçéèêëîïôœùûüÿ]"),
-            "de", Pattern.compile("[äöüß]"),
-            "zh", Pattern.compile("[\\u4e00-\\u9fff]"),
-            "ja", Pattern.compile("[\\u3040-\\u30ff\\u4e00-\\u9fff]"),
-            "ko", Pattern.compile("[\\uac00-\\ud7af\\u1100-\\u11ff]")
-    );
-
-    public static CompletableFuture<String> translate(String text) {
-        return translate(text,
-                ModConfig.TARGET_LANGUAGE.get(),
-                ModConfig.AUTO_DETECT_SOURCE.get() ? null : ModConfig.SOURCE_LANGUAGE.get());
+    private static final Map<String, Pattern> LANGUAGE_PATTERNS = new HashMap<>();
+    static {
+        LANGUAGE_PATTERNS.put("ru", Pattern.compile("[а-яА-ЯёЁ]"));
+        LANGUAGE_PATTERNS.put("en", Pattern.compile("[a-zA-Z]"));
+        LANGUAGE_PATTERNS.put("da", Pattern.compile("[æøåÆØÅ]"));
+        LANGUAGE_PATTERNS.put("es", Pattern.compile("[áéíóúñü¿¡]"));
+        LANGUAGE_PATTERNS.put("fr", Pattern.compile("[àâæçéèêëîïôœùûüÿ]"));
+        LANGUAGE_PATTERNS.put("de", Pattern.compile("[äöüß]"));
+        LANGUAGE_PATTERNS.put("zh", Pattern.compile("[\\u4e00-\\u9fff]"));
+        LANGUAGE_PATTERNS.put("ja", Pattern.compile("[\\u3040-\\u30ff\\u4e00-\\u9fff]"));
+        LANGUAGE_PATTERNS.put("ko", Pattern.compile("[\\uac00-\\ud7af\\u1100-\\u11ff]"));
+        LANGUAGE_PATTERNS.put("it", Pattern.compile("[àèìòù]"));
+        LANGUAGE_PATTERNS.put("pt", Pattern.compile("[ãõçáéíóú]"));
+        LANGUAGE_PATTERNS.put("pl", Pattern.compile("[ąćęłńóśźż]"));
+        LANGUAGE_PATTERNS.put("uk", Pattern.compile("[ієїґ]"));
     }
 
-    public static CompletableFuture<String> translate(String text, String targetLang, String sourceLang) {
-        final String finalText = text;
-        final String finalTargetLang = targetLang;
-        final String finalSourceLang = sourceLang;
+    // Приоритет сервисов для fallback
+    private static final List<String> SERVICE_PRIORITY = Arrays.asList(
+            "yandex", "deepl", "libre", "lingva", "mymemory"
+    );
 
+    static {
+        // Инициализация rate limiters
+        RATE_LIMITERS.put("mymemory", new RateLimiter(DEFAULT_RATE_LIMIT, 60));
+        RATE_LIMITERS.put("libre", new RateLimiter(DEFAULT_RATE_LIMIT, 60));
+        RATE_LIMITERS.put("lingva", new RateLimiter(DEFAULT_RATE_LIMIT, 60));
+        RATE_LIMITERS.put("yandex", new RateLimiter(DEFAULT_RATE_LIMIT, 60));
+        RATE_LIMITERS.put("deepl", new RateLimiter(DEEPL_RATE_LIMIT, 60));
+
+        // Загрузка кэша из файла
+        loadCacheFromFile();
+
+        // Периодическое сохранение кэша
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(
+                TranslationManager::saveCacheToFile,
+                5, 5, TimeUnit.MINUTES
+        );
+    }
+
+    /**
+     * Основной метод перевода с fallback между сервисами
+     */
+    public static CompletableFuture<String> translate(String text, String targetLang, String sourceLang) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                if (finalText == null || finalText.trim().isEmpty()) {
-                    return finalText;
+                if (text == null || text.trim().isEmpty()) {
+                    return text;
+                }
+
+                // Разбиение длинных сообщений
+                if (text.length() > 4000) {
+                    return translateLongText(text, targetLang, sourceLang);
                 }
 
                 // Проверяем кэш
-                String cacheKey = finalText + "|" + finalTargetLang + "|" + finalSourceLang;
-                if (TRANSLATION_CACHE.containsKey(cacheKey)) {
+                String cacheKey = text + "|" + targetLang + "|" + sourceLang;
+                String cached = TRANSLATION_CACHE.get(cacheKey);
+                if (cached != null) {
                     LOGGER.debug("Cache hit: {}", cacheKey);
-                    return TRANSLATION_CACHE.get(cacheKey);
+                    return cached;
                 }
 
                 // Определяем исходный язык, если нужно
-                String detectedSource = finalSourceLang;
-                if (detectedSource == null) {
-                    detectedSource = detectLanguage(finalText);
+                String detectedSource = sourceLang;
+                if (detectedSource == null || ModConfig.AUTO_DETECT_SOURCE.get()) {
+                    detectedSource = detectLanguage(text);
                     LOGGER.debug("Detected source language: {}", detectedSource);
                 }
 
                 // Если текст уже на целевом языке, не переводим
-                if (detectedSource.equals(finalTargetLang)) {
+                if (detectedSource.equals(targetLang)) {
                     LOGGER.debug("Text already in target language");
-                    return finalText;
+                    return text;
                 }
 
-                String translated = null;
-                String service = ModConfig.TRANSLATION_SERVICE.get();
+                // Пробуем перевести с приоритетом сервисов
+                String translated = translateWithFallback(text, detectedSource, targetLang);
 
-                // Выбираем сервис перевода
-                switch (service) {
-                    case "yandex":
-                        LOGGER.debug("Using Yandex Translate");
-                        translated = translateWithYandex(finalText, detectedSource, finalTargetLang);
-                        break;
-                    case "mymemory":
-                        LOGGER.debug("Using MyMemory");
-                        translated = translateWithMyMemory(finalText, detectedSource, finalTargetLang);
-                        break;
-                    default:
-                        LOGGER.debug("Using MyMemory");
-                        translated = translateWithMyMemory(finalText, detectedSource, finalTargetLang);
-                        break;
-                }
-
-                if (translated != null && !translated.equals(finalText) && !isErrorMessage(translated)) {
+                if (translated != null && !translated.equals(text) && !isErrorMessage(translated)) {
                     translated = translated.replace("+", " ");
                     TRANSLATION_CACHE.put(cacheKey, translated);
                     LOGGER.info("Translated [{}->{}]: {} -> {}",
-                            detectedSource, finalTargetLang, finalText, translated);
+                            detectedSource, targetLang, text, translated);
                     return translated;
                 }
 
-                return finalText;
+                return text;
 
             } catch (Exception e) {
-                LOGGER.error("Translation error: {}", e.getMessage());
-                return finalText;
+                LOGGER.error("Translation error: {}", e.getMessage(), e);
+                return text;
             }
         }, EXECUTOR);
     }
 
-    private static String detectLanguage(String text) {
-        for (Map.Entry<String, Pattern> entry : LANGUAGE_PATTERNS.entrySet()) {
-            if (entry.getValue().matcher(text).find()) {
-                return entry.getKey();
+    /**
+     * Перевод длинных текстов с разбиением на части
+     */
+    private static String translateLongText(String text, String targetLang, String sourceLang) {
+        LOGGER.debug("Translating long text ({} chars)", text.length());
+
+        // Разбиваем по предложениям
+        String[] sentences = text.split("(?<=[.!?])\\s+");
+        StringBuilder result = new StringBuilder();
+
+        for (String sentence : sentences) {
+            if (sentence.trim().isEmpty()) continue;
+
+            String translated = translate(sentence, targetLang, sourceLang).join();
+            result.append(translated).append(" ");
+
+            // Небольшая пауза для rate limiting
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
             }
         }
-        return "en";
+
+        return result.toString().trim();
+    }
+
+    /**
+     * Перевод с fallback между сервисами
+     */
+    private static String translateWithFallback(String text, String sourceLang, String targetLang) {
+        String preferredService = ModConfig.TRANSLATION_SERVICE.get();
+        List<String> servicesToTry = new ArrayList<>();
+
+        // Сначала пробуем предпочтительный сервис
+        servicesToTry.add(preferredService);
+
+        // Затем остальные по приоритету
+        for (String service : SERVICE_PRIORITY) {
+            if (!servicesToTry.contains(service)) {
+                servicesToTry.add(service);
+            }
+        }
+
+        for (String service : servicesToTry) {
+            try {
+                // Проверяем rate limit
+                if (!RATE_LIMITERS.get(service).tryAcquire()) {
+                    LOGGER.debug("Rate limit exceeded for {}", service);
+                    continue;
+                }
+
+                String translated = switch (service) {
+                    case "yandex" -> translateWithYandex(text, sourceLang, targetLang);
+                    case "deepl" -> translateWithDeepL(text, sourceLang, targetLang);
+                    case "libre" -> translateWithLibre(text, sourceLang, targetLang);
+                    case "lingva" -> translateWithLingva(text, targetLang);
+                    case "mymemory" -> translateWithMyMemory(text, sourceLang, targetLang);
+                    default -> null;
+                };
+
+                if (translated != null && !isErrorMessage(translated)) {
+                    LOGGER.debug("Successfully translated with {}", service);
+                    return translated;
+                }
+            } catch (Exception e) {
+                LOGGER.debug("Service {} failed: {}", service, e.getMessage());
+            }
+        }
+
+        LOGGER.warn("All translation services failed");
+        return null;
+    }
+
+    private static String detectLanguage(String text) {
+        Map<String, Integer> scores = new HashMap<>();
+
+        for (Map.Entry<String, Pattern> entry : LANGUAGE_PATTERNS.entrySet()) {
+            int count = 0;
+            var matcher = entry.getValue().matcher(text);
+            while (matcher.find()) {
+                count++;
+            }
+            if (count > 0) {
+                scores.put(entry.getKey(), count);
+            }
+        }
+
+        if (scores.isEmpty()) {
+            return "en";
+        }
+
+        // Возвращаем язык с наибольшим количеством совпадений
+        return scores.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse("en");
     }
 
     private static String translateWithMyMemory(String text, String sourceLang, String targetLang) {
@@ -132,12 +250,10 @@ public class TranslationManager {
                     targetLang
             );
 
-            LOGGER.debug("MyMemory request: {}", url);
-
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .header("User-Agent", "Minecraft-Chat-Translator/1.0")
-                    .timeout(java.time.Duration.ofSeconds(5))
+                    .timeout(Duration.ofSeconds(10))
                     .GET()
                     .build();
 
@@ -148,13 +264,9 @@ public class TranslationManager {
                 JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
 
                 if (json.has("responseData")) {
-                    String translated = json.get("responseData")
-                            .getAsJsonObject()
-                            .get("translatedText")
-                            .getAsString();
-
-                    if (translated != null && !translated.isEmpty() && !translated.equals(text)) {
-                        return translated;
+                    JsonObject responseData = json.getAsJsonObject("responseData");
+                    if (responseData.has("translatedText")) {
+                        return responseData.get("translatedText").getAsString();
                     }
                 }
             }
@@ -167,14 +279,79 @@ public class TranslationManager {
         }
     }
 
+    private static String translateWithLingva(String text, String targetLang) {
+        try {
+            String encodedText = URLEncoder.encode(text, StandardCharsets.UTF_8);
+            String url = String.format(
+                    "https://lingva.ml/api/v1/auto/%s/%s",
+                    targetLang,
+                    encodedText
+            );
 
-    // НОВОЕ: Метод для Yandex Translate
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("User-Agent", "Minecraft-Chat-Translator/1.0")
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = CLIENT.send(request,
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+                if (json.has("translation")) {
+                    return json.get("translation").getAsString();
+                }
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            LOGGER.debug("Lingva request failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private static String translateWithLibre(String text, String sourceLang, String targetLang) {
+        try {
+            JsonObject requestBody = new JsonObject();
+            requestBody.addProperty("q", text);
+            requestBody.addProperty("source", sourceLang);
+            requestBody.addProperty("target", targetLang);
+            requestBody.addProperty("format", "text");
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://libretranslate.com/translate"))
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "Minecraft-Chat-Translator/1.0")
+                    .timeout(Duration.ofSeconds(10))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
+                    .build();
+
+            HttpResponse<String> response = CLIENT.send(request,
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+                if (json.has("translatedText")) {
+                    return json.get("translatedText").getAsString();
+                }
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            LOGGER.debug("LibreTranslate request failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
     private static String translateWithYandex(String text, String sourceLang, String targetLang) {
         try {
             String apiKey = ModConfig.YANDEX_API_KEY.get();
             String folderId = ModConfig.YANDEX_FOLDER_ID.get();
 
-            // Проверяем, что ключи есть
             if (apiKey.isEmpty() || folderId.isEmpty()) {
                 LOGGER.debug("Yandex API key or Folder ID not configured");
                 return null;
@@ -185,7 +362,6 @@ public class TranslationManager {
             JsonObject requestBody = new JsonObject();
             requestBody.addProperty("folderId", folderId);
 
-            // Текст для перевода
             JsonArray texts = new JsonArray();
             texts.add(text);
             requestBody.add("texts", texts);
@@ -198,11 +374,9 @@ public class TranslationManager {
                     .header("Content-Type", "application/json")
                     .header("Authorization", "Api-Key " + apiKey)
                     .header("User-Agent", "Minecraft-Chat-Translator/1.0")
-                    .timeout(java.time.Duration.ofSeconds(5))
+                    .timeout(Duration.ofSeconds(10))
                     .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
                     .build();
-
-            LOGGER.debug("Yandex Translate request for: {}", text);
 
             HttpResponse<String> response = CLIENT.send(request,
                     HttpResponse.BodyHandlers.ofString());
@@ -211,17 +385,11 @@ public class TranslationManager {
                 JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
 
                 if (json.has("translations")) {
-                    String translated = json.get("translations")
-                            .getAsJsonArray()
+                    return json.getAsJsonArray("translations")
                             .get(0)
                             .getAsJsonObject()
                             .get("text")
                             .getAsString();
-
-                    if (translated != null && !translated.isEmpty()) {
-                        LOGGER.debug("Yandex Translate success: {} -> {}", text, translated);
-                        return translated;
-                    }
                 }
             } else {
                 LOGGER.debug("Yandex API error: {} - {}", response.statusCode(), response.body());
@@ -235,16 +403,245 @@ public class TranslationManager {
         }
     }
 
+    /**
+     * Перевод через DeepL API
+     */
+    private static String translateWithDeepL(String text, String sourceLang, String targetLang) {
+        try {
+            String apiKey = ModConfig.DEEPL_API_KEY.get();
+
+            if (apiKey.isEmpty()) {
+                LOGGER.debug("DeepL API key not configured");
+                return null;
+            }
+
+            String url = "https://api-free.deepl.com/v2/translate";
+
+            JsonObject requestBody = new JsonObject();
+            JsonArray texts = new JsonArray();
+            texts.add(text);
+            requestBody.add("texts", texts);
+
+            requestBody.addProperty("source_lang", sourceLang.toUpperCase());
+            requestBody.addProperty("target_lang", targetLang.toUpperCase());
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "DeepL-Auth-Key " + apiKey)
+                    .header("User-Agent", "Minecraft-Chat-Translator/1.0")
+                    .timeout(Duration.ofSeconds(10))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
+                    .build();
+
+            HttpResponse<String> response = CLIENT.send(request,
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+
+                if (json.has("translations")) {
+                    JsonArray translations = json.getAsJsonArray("translations");
+                    StringBuilder result = new StringBuilder();
+
+                    for (int i = 0; i < translations.size(); i++) {
+                        if (i > 0) result.append(" ");
+                        result.append(translations.get(i)
+                                .getAsJsonObject()
+                                .get("text")
+                                .getAsString());
+                    }
+
+                    return result.toString();
+                }
+            } else {
+                LOGGER.debug("DeepL API error: {} - {}", response.statusCode(), response.body());
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            LOGGER.debug("DeepL request failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
     private static boolean isErrorMessage(String text) {
-        return text.contains("INVALID") ||
-                text.contains("ERROR") ||
-                text.contains("AUTO IS AN INVALID") ||
-                text.contains("CANNOT TRANSLATE") ||
+        if (text == null || text.isEmpty()) return true;
+
+        String lower = text.toLowerCase();
+        return lower.contains("invalid") ||
+                lower.contains("error") ||
+                lower.contains("cannot translate") ||
+                lower.contains("too many requests") ||
+                lower.contains("rate limit") ||
                 text.matches(".*\\b(error|failed)\\b.*");
     }
 
+    /**
+     * Загрузка кэша из файла
+     */
+    private static void loadCacheFromFile() {
+        try {
+            File cacheFile = CACHE_FILE.toFile();
+            if (!cacheFile.exists()) {
+                LOGGER.debug("Cache file does not exist, starting fresh");
+                return;
+            }
+
+            String json = new String(java.nio.file.Files.readAllBytes(CACHE_FILE), StandardCharsets.UTF_8);
+            JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+
+            if (root.has("translations")) {
+                JsonObject translations = root.getAsJsonObject("translations");
+                for (Map.Entry<String, com.google.gson.JsonElement> entry : translations.entrySet()) {
+                    TRANSLATION_CACHE.put(entry.getKey(), entry.getValue().getAsString());
+                }
+                LOGGER.info("Loaded {} cached translations", translations.size());
+            }
+
+        } catch (Exception e) {
+            LOGGER.warn("Failed to load cache from file: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Сохранение кэша в файл
+     */
+    private static void saveCacheToFile() {
+        try {
+            JsonObject root = new JsonObject();
+            JsonObject translations = new JsonObject();
+
+            for (Map.Entry<String, String> entry : TRANSLATION_CACHE.entrySet()) {
+                translations.addProperty(entry.getKey(), entry.getValue());
+            }
+
+            root.add("translations", translations);
+            root.addProperty("version", 1);
+            root.addProperty("timestamp", System.currentTimeMillis());
+
+            String json = root.toString();
+            java.nio.file.Files.writeString(CACHE_FILE, json, StandardCharsets.UTF_8);
+
+            LOGGER.debug("Saved {} translations to cache file", TRANSLATION_CACHE.size());
+
+        } catch (Exception e) {
+            LOGGER.warn("Failed to save cache to file: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Очистка кэша
+     */
     public static void clearCache() {
         TRANSLATION_CACHE.clear();
+        saveCacheToFile();
         LOGGER.info("Translation cache cleared");
+    }
+
+    /**
+     * Получить статистику кэша
+     */
+    public static Map<String, Object> getCacheStats() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("size", TRANSLATION_CACHE.size());
+        stats.put("maxSize", MAX_CACHE_SIZE);
+        stats.put("hitRate", TRANSLATION_CACHE.getHitRate());
+        return stats;
+    }
+
+    /**
+     * LRU кэш с ограничением размера и подсчётом hit rate (package-private для тестов)
+     */
+    static class TranslationCache {
+        private final LinkedHashMap<String, String> cache;
+        private final int maxSize;
+        private int hits = 0;
+        private int misses = 0;
+
+        public TranslationCache(int maxSize) {
+            this.maxSize = maxSize;
+            this.cache = new LinkedHashMap<String, String>(maxSize, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > maxSize;
+                }
+            };
+        }
+
+        public synchronized String get(String key) {
+            String value = cache.get(key);
+            if (value != null) {
+                hits++;
+            } else {
+                misses++;
+            }
+            return value;
+        }
+
+        public synchronized void put(String key, String value) {
+            cache.put(key, value);
+        }
+
+        public synchronized double getHitRate() {
+            int total = hits + misses;
+            if (total == 0) return 0.0;
+            return (double) hits / total * 100;
+        }
+
+        public synchronized int size() {
+            return cache.size();
+        }
+
+        public synchronized void clear() {
+            cache.clear();
+            hits = 0;
+            misses = 0;
+        }
+
+        public synchronized Set<Map.Entry<String, String>> entrySet() {
+            return cache.entrySet();
+        }
+    }
+
+    /**
+     * Rate limiter для ограничения частоты запросов (package-private для тестов)
+     */
+    static class RateLimiter {
+        private final int maxRequests;
+        private final long timeWindowMs;
+        private final Queue<Long> requestTimes = new ConcurrentLinkedQueue<>();
+
+        public RateLimiter(int maxRequests, long timeWindowSeconds) {
+            this.maxRequests = maxRequests;
+            this.timeWindowMs = timeWindowSeconds * 1000;
+        }
+
+        public synchronized boolean tryAcquire() {
+            long now = System.currentTimeMillis();
+
+            // Удаляем старые запросы за пределами временного окна
+            requestTimes.removeIf(time -> now - time > timeWindowMs);
+
+            if (requestTimes.size() < maxRequests) {
+                requestTimes.add(now);
+                return true;
+            }
+
+            return false;
+        }
+
+        public synchronized long getWaitTime() {
+            long now = System.currentTimeMillis();
+            Long oldestRequest = requestTimes.peek();
+
+            if (oldestRequest == null) {
+                return 0;
+            }
+
+            long waitTime = timeWindowMs - (now - oldestRequest);
+            return Math.max(0, waitTime);
+        }
     }
 }
