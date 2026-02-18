@@ -13,6 +13,7 @@ import net.neoforged.fml.common.EventBusSubscriber;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -20,8 +21,10 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ChatHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger(ChatHandler.class);
     private static final Map<String, Long> PROCESSED_MESSAGES = new ConcurrentHashMap<>();
-    private static final long MESSAGE_TIMEOUT = 2000;
+    private static final long MESSAGE_TIMEOUT = 0; // Увеличил до 3 секунд
     private static boolean isProcessing = false;
+    private static String lastSentMessage = "";
+    private static String lastSentTranslation = ""; // Запоминаем перевод
 
     @SubscribeEvent
     public static void onClientChat(ClientChatEvent event) {
@@ -30,10 +33,11 @@ public class ChatHandler {
 
         String message = event.getMessage();
         if (message.startsWith("/")) return;
-
+        if (message.startsWith("!")) return;
         String messageHash = message + System.currentTimeMillis() / 1000;
         if (PROCESSED_MESSAGES.containsKey(messageHash)) return;
 
+        lastSentMessage = message;
         PROCESSED_MESSAGES.put(messageHash, System.currentTimeMillis());
         event.setCanceled(true);
         isProcessing = true;
@@ -50,6 +54,7 @@ public class ChatHandler {
                             try {
                                 if (Minecraft.getInstance().player != null) {
                                     Minecraft.getInstance().player.connection.sendChat(translated);
+                                    lastSentTranslation = translated; // Запоминаем перевод
                                     LOGGER.info("Ваше сообщение: {} -> {}", message, translated);
                                 }
                             } finally {
@@ -73,40 +78,48 @@ public class ChatHandler {
             isProcessing = false;
         }
     }
+    private static String stripColorCodes(String text) {
+        // Удаляет все §-коды (цвета и форматирование)
+        return text.replaceAll("§[0-9a-fk-or]", "");
+    }
 
     @SubscribeEvent
     public static void onChatReceived(ClientChatReceivedEvent event) {
-        // Проверка на обработку
         if (isProcessing) {
-            LOGGER.debug("Already processing, skipping received message");
+            LOGGER.debug("Уже обрабатывается, пропускаем");
             return;
         }
 
-        if (!ModConfig.ENABLE_TRANSLATION.get()) {
-            LOGGER.debug("Translation disabled");
-            return;
-        }
-
-        if (!ModConfig.TRANSLATE_INCOMING.get()) {
-            LOGGER.debug("Incoming translation disabled");
+        if (!ModConfig.ENABLE_TRANSLATION.get() || !ModConfig.TRANSLATE_INCOMING.get()) {
             return;
         }
 
         Component originalComponent = event.getMessage();
-        String originalText = originalComponent.getString();
-
-        LOGGER.info("Received message: {}", originalText);
-
+        String fullMessage = originalComponent.getString();
+        fullMessage = stripColorCodes(fullMessage);
+        LOGGER.debug(fullMessage);
+        if (fullMessage.startsWith("!")) return;
+        if (fullMessage.startsWith("Пер")) return;
         // Пропускаем системные сообщения
-        if (shouldSkipMessage(originalText)) {
-            LOGGER.debug("Skipping system message: {}", originalText);
+        if (shouldSkipMessage(fullMessage)) {
             return;
         }
 
-        // Проверяем, не обрабатывали ли мы это сообщение
-        String messageHash = originalText + System.currentTimeMillis() / 1000;
+        // УЛУЧШЕНО: Пропускаем свои сообщения
+        if (!lastSentMessage.isEmpty() && fullMessage.contains(lastSentMessage)) {
+            LOGGER.debug("Пропускаем своё сообщение (оригинал)");
+            return;
+        }
+
+        // Также пропускаем переводы своих сообщений
+        if (!lastSentTranslation.isEmpty() && fullMessage.contains(lastSentTranslation)) {
+            LOGGER.debug("Пропускаем своё сообщение (перевод)");
+            return;
+        }
+
+        String messageHash = fullMessage + System.currentTimeMillis() / 1000;
         if (PROCESSED_MESSAGES.containsKey(messageHash)) {
-            LOGGER.debug("Already processed this message");
+            LOGGER.debug("Сообщение уже обработано");
             return;
         }
 
@@ -114,38 +127,55 @@ public class ChatHandler {
         isProcessing = true;
 
         try {
-            // Для входящих: переводим с TARGET (en) на SOURCE (ru)
-            String sourceLang = ModConfig.TARGET_LANGUAGE.get();      // en (с какого)
-            String targetLang = ModConfig.SOURCE_LANGUAGE.get();      // ru (на какой)
+            int colonIndex = fullMessage.indexOf(':')+1;
 
-            LOGGER.info("Incoming translation: {} -> {}", sourceLang, targetLang);
+            String prefix;
+            String textToTranslate;
+            LOGGER.debug(Arrays.toString(fullMessage.split(" ")));
+            if (colonIndex != -1) {
+                // Есть двоеточие - разделяем
+                prefix = ""; // Включаем двоеточие
+                textToTranslate = fullMessage.substring(colonIndex).trim();
+            } else {
+                prefix = "";
+                textToTranslate = fullMessage;
+            }
 
-            TranslationManager.translate(originalText, targetLang, sourceLang)
+            LOGGER.debug("Префикс: {}", prefix);
+            LOGGER.debug("Текст для перевода: {}", textToTranslate);
+            String sourceLang = ModConfig.SOURCE_LANGUAGE.get();      // ru
+            String targetLang = ModConfig.TARGET_LANGUAGE.get();      // en
+
+            TranslationManager.translate(textToTranslate, sourceLang, targetLang)
                     .thenAcceptAsync(translated -> {
                         Minecraft.getInstance().execute(() -> {
                             try {
-                                if (translated == null || translated.equals(originalText)) {
-                                    LOGGER.debug("Перевод не нужен или не удался");
+                                if (translated == null || translated.equals(textToTranslate)) {
+                                    LOGGER.debug("Перевод не удался");
+                                    return;
+                                }
+                                if (translated.equals(textToTranslate)) {
+                                    LOGGER.debug("Перевод не нужен");
                                     return;
                                 }
 
-                                LOGGER.info("Переведено: {} -> {}", originalText, translated);
+                                LOGGER.info("Получено (английский): {}", textToTranslate);
+                                LOGGER.info("Перевод (русский): {}", translated);
 
-                                // ИСПРАВЛЕНО: Создаем новое сообщение
-                                Component newMessage;
-                                if (ModConfig.SHOW_ORIGINAL.get()) {
-                                    newMessage = Component.literal("")
-                                            .append(Component.literal(originalText).withStyle(ChatFormatting.GRAY))
-                                            .append(Component.literal(" → ").withStyle(ChatFormatting.DARK_GRAY))
-                                            .append(Component.literal(translated).withStyle(ChatFormatting.WHITE));
-                                } else {
-                                    newMessage = Component.literal(translated);
+                                if (Minecraft.getInstance().player != null) {
+                                    String finalTranslated;
+                                    if (colonIndex != -1) {
+                                        finalTranslated = prefix + " " + translated;
+                                    } else {
+                                        finalTranslated = translated;
+                                    }
+
+                                    Component translatedMessage = Component.literal("")
+                                            .append(Component.literal("Перевод").withStyle(ChatFormatting.RED))
+                                            .append(Component.literal(finalTranslated).withStyle(ChatFormatting.WHITE));
+
+                                    Minecraft.getInstance().player.sendSystemMessage(translatedMessage);
                                 }
-
-                                // ИСПРАВЛЕНО: Принудительно устанавливаем новое сообщение
-                                event.setMessage(newMessage);
-
-                                LOGGER.info("Сообщение в чате обновлено");
 
                             } finally {
                                 isProcessing = false;
@@ -168,12 +198,26 @@ public class ChatHandler {
     private static boolean shouldSkipMessage(String text) {
         if (text == null || text.isEmpty()) return true;
 
-        // Пропускаем системные сообщения
         return text.contains("joined the game") ||
+                text.contains("получил") ||
+                text.contains("был") ||
+                text.contains("just join") ||
                 text.contains("left the game") ||
                 text.contains("вошел в игру") ||
+                text.contains("присоединился") ||
+                text.contains("Remember to check the rules. Failing to comply may result in a ban!") ||
+                text.contains("Check out the RP bonuses on the Discord") ||
+                text.contains("Make sure to create a faction to keep your lands safe") ||
+                text.contains("Take a look at the webmap by clicking here") ||
+                text.contains("Haven't joined our Discord yet? Click on this message to join!") ||
+                text.contains("Faction color updated to white") ||
                 text.contains("вышел из игры") ||
+                text.contains("игре") ||
+                text.contains("покинул") ||
+                text.contains("проспите") ||
+                text.contains("ночь") ||
                 text.contains("[Server]") ||
+                text.contains("застрелен") ||
                 text.startsWith("!") ||
                 text.startsWith("/") ||
                 text.contains("★");
@@ -185,3 +229,5 @@ public class ChatHandler {
                 now - entry.getValue() > MESSAGE_TIMEOUT);
     }
 }
+
+

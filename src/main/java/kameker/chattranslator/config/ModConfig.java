@@ -8,7 +8,7 @@ import kameker.chattranslator.Chattranslator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-@EventBusSubscriber(modid = Chattranslator.MODID, bus = EventBusSubscriber.Bus.MOD)
+@EventBusSubscriber(modid = Chattranslator.MODID)
 public class ModConfig {
     private static final Logger LOGGER = LoggerFactory.getLogger(ModConfig.class);
 
@@ -36,12 +36,12 @@ public class ModConfig {
 
     static {
         YANDEX_API_KEY = BUILDER
-                .comment("AQVNyQFzODCqZaDWjOjPyouWm_bFuZaiybB84dSY")
-                .define("yandexApiKey", "AQVNyQFzODCqZaDWjOjPyouWm_bFuZaiybB84dSY");
+                .comment("yandex api key")
+                .define("yandexApiKey", "");
 
         YANDEX_FOLDER_ID = BUILDER
-                .comment("b1g5n4985m621mc6h3vn")
-                .define("yandexFolderId", "b1g5n4985m621mc6h3vn");
+                .comment("yanex folder id")
+                .define("yandexFolderId", "");
         BUILDER.push("General Settings");
 
         ENABLE_TRANSLATION = BUILDER

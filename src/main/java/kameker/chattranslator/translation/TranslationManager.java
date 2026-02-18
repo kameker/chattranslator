@@ -86,14 +86,6 @@ public class TranslationManager {
                         LOGGER.debug("Using Yandex Translate");
                         translated = translateWithYandex(finalText, detectedSource, finalTargetLang);
                         break;
-                    case "lingva":
-                        LOGGER.debug("Using Lingva");
-                        translated = translateWithLingva(finalText, finalTargetLang);
-                        break;
-                    case "libretranslate":
-                        LOGGER.debug("Using LibreTranslate");
-                        translated = translateWithLibre(finalText, detectedSource, finalTargetLang);
-                        break;
                     case "mymemory":
                         LOGGER.debug("Using MyMemory");
                         translated = translateWithMyMemory(finalText, detectedSource, finalTargetLang);
@@ -175,76 +167,6 @@ public class TranslationManager {
         }
     }
 
-    private static String translateWithLingva(String text, String targetLang) {
-        try {
-            String encodedText = URLEncoder.encode(text, StandardCharsets.UTF_8);
-            String url = String.format(
-                    "https://lingva.ml/api/v1/auto/%s/%s",
-                    targetLang,
-                    encodedText
-            );
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("User-Agent", "Minecraft-Chat-Translator/1.0")
-                    .timeout(java.time.Duration.ofSeconds(5))
-                    .GET()
-                    .build();
-
-            HttpResponse<String> response = CLIENT.send(request,
-                    HttpResponse.BodyHandlers.ofString());
-
-            if (response.statusCode() == 200) {
-                JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
-                if (json.has("translation")) {
-                    String translated = json.get("translation").getAsString();
-                    if (!translated.equals(text)) {
-                        return translated;
-                    }
-                }
-            }
-
-            return null;
-
-        } catch (Exception e) {
-            LOGGER.debug("Lingva request failed: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    private static String translateWithLibre(String text, String sourceLang, String targetLang) {
-        try {
-            JsonObject requestBody = new JsonObject();
-            requestBody.addProperty("q", text);
-            requestBody.addProperty("source", sourceLang);
-            requestBody.addProperty("target", targetLang);
-            requestBody.addProperty("format", "text");
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create("https://libretranslate.com/translate"))
-                    .header("Content-Type", "application/json")
-                    .header("User-Agent", "Minecraft-Chat-Translator/1.0")
-                    .timeout(java.time.Duration.ofSeconds(5))
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
-                    .build();
-
-            HttpResponse<String> response = CLIENT.send(request,
-                    HttpResponse.BodyHandlers.ofString());
-
-            if (response.statusCode() == 200) {
-                JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
-                if (json.has("translatedText")) {
-                    return json.get("translatedText").getAsString();
-                }
-            }
-
-            return null;
-
-        } catch (Exception e) {
-            LOGGER.debug("LibreTranslate request failed: {}", e.getMessage());
-            return null;
-        }
-    }
 
     // НОВОЕ: Метод для Yandex Translate
     private static String translateWithYandex(String text, String sourceLang, String targetLang) {
