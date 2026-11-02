@@ -1,95 +1,112 @@
 package kameker.chattranslator.translation;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.DisplayName;
 
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Unit-тесты для TranslationManager (без зависимости от Minecraft)
- */
-public class TranslationManagerTest {
+class TranslationManagerTest {
 
-    @BeforeEach
-    void setUp() {
-        // Очистка кэша перед каждым тестом
-        // TranslationManager.clearCache(); // Вызывает ошибку без Minecraft
+    @Test
+    void requestKeepsSourceAndTargetInNamedFields() {
+        var request = new TranslationManager.TranslationRequest("hello", "en", "ru");
+        assertEquals("en", request.sourceLanguage());
+        assertEquals("ru", request.targetLanguage());
+        assertThrows(IllegalArgumentException.class,
+                () -> new TranslationManager.TranslationRequest("hello", "en", " "));
     }
 
     @Test
-    @DisplayName("Пустая строка возвращается без изменений")
-    void testEmptyString() {
-        // Пропускаем тест, требующий Minecraft
-        assertTrue(true, "Тест требует Minecraft runtime");
+    void detectsSupportedWritingSystems() {
+        assertEquals("ru", TranslationEngine.detectLanguage("Привет мир"));
+        assertEquals("uk", TranslationEngine.detectLanguage("Привіт, як твої справи?"));
+        assertEquals("en", TranslationEngine.detectLanguage("Hello world"));
+        assertEquals("zh", TranslationEngine.detectLanguage("你好世界"));
+        assertEquals("ja", TranslationEngine.detectLanguage("こんにちは世界"));
+        assertEquals("ko", TranslationEngine.detectLanguage("안녕하세요"));
+        assertEquals("es", TranslationEngine.detectLanguage("¿Cómo está?"));
     }
 
     @Test
-    @DisplayName("Null возвращается без изменений")
-    void testNullString() {
-        assertTrue(true, "Тест требует Minecraft runtime");
+    void detectsProviderErrorMessages() {
+        assertTrue(TranslationEngine.isErrorMessage("INVALID REQUEST"));
+        assertTrue(TranslationEngine.isErrorMessage("ERROR: Translation failed"));
+        assertTrue(TranslationEngine.isErrorMessage("Too many requests"));
+        assertFalse(TranslationEngine.isErrorMessage("C++ is useful"));
     }
 
     @Test
-    @DisplayName("Определение русского языка")
-    void testDetectRussianLanguage() {
-        String text = "Привет мир";
-        // Проверяем, что текст содержит кириллические символы
-        assertTrue(text.matches(".*[а-яА-ЯёЁ].*"));
+    void fallbackStartsWithPreferredProvider() {
+        List<String> calls = new java.util.ArrayList<>();
+        Map<String, TranslationEngine.Service> services = new LinkedHashMap<>();
+        services.put("first", (text, source, target) -> {
+            calls.add("first");
+            return null;
+        });
+        services.put("preferred", (text, source, target) -> {
+            calls.add("preferred");
+            assertEquals("en", source);
+            assertEquals("ru", target);
+            return "перевод";
+        });
+
+        String result = TranslationEngine.translateWithFallback(
+                "text", "en", "ru", "preferred", services,
+                List.of("first", "preferred"), ignored -> true);
+
+        assertEquals("перевод", result);
+        assertEquals(List.of("preferred"), calls);
     }
 
     @Test
-    @DisplayName("Определение английского языка")
-    void testDetectEnglishLanguage() {
-        String text = "Hello world";
-        // Проверяем, что текст содержит латинские символы
-        assertTrue(text.matches(".*[a-zA-Z].*"));
+    void fallbackContinuesAfterFailureAndErrorResponse() {
+        List<String> calls = new java.util.ArrayList<>();
+        Map<String, TranslationEngine.Service> services = new LinkedHashMap<>();
+        services.put("broken", (text, source, target) -> {
+            calls.add("broken");
+            throw new java.io.IOException("offline");
+        });
+        services.put("bad-response", (text, source, target) -> {
+            calls.add("bad-response");
+            return "ERROR: unavailable";
+        });
+        services.put("working", (text, source, target) -> {
+            calls.add("working");
+            return "ok";
+        });
+
+        String result = TranslationEngine.translateWithFallback(
+                "text", "en", "ru", "broken", services,
+                List.of("bad-response", "working"), ignored -> true);
+
+        assertEquals("ok", result);
+        assertEquals(List.of("broken", "bad-response", "working"), calls);
     }
 
     @Test
-    @DisplayName("Определение китайского языка")
-    void testDetectChineseLanguage() {
-        String text = "你好世界";
-        // Проверяем, что текст содержит китайские иероглифы
-        assertTrue(text.matches(".*[\\u4e00-\\u9fff].*"));
+    void fallbackHonoursRateLimiter() {
+        Map<String, TranslationEngine.Service> services = Map.of(
+                "blocked", (text, source, target) -> fail("Blocked provider must not be called"),
+                "working", (text, source, target) -> "ok"
+        );
+
+        String result = TranslationEngine.translateWithFallback(
+                "text", "en", "ru", "blocked", services,
+                List.of("working"), service -> !service.equals("blocked"));
+
+        assertEquals("ok", result);
     }
 
     @Test
-    @DisplayName("LRU кэш сохраняет переводы")
-    void testCacheStoresTranslations() {
-        // Тестируем напрямую через TranslationCache
-        TranslationManager.TranslationCache cache = new TranslationManager.TranslationCache(100);
-        cache.put("key1", "value1");
-        assertEquals("value1", cache.get("key1"));
-        assertEquals(1, cache.size());
-    }
+    void splitsLongUnpunctuatedTextWithoutOversizedChunks() {
+        String text = "word ".repeat(2_000).trim();
+        List<String> chunks = TranslationEngine.splitText(text, 4_000);
 
-    @Test
-    @DisplayName("Проверка на ошибку перевода")
-    void testErrorMessageDetection() {
-        assertTrue(isErrorMessage("INVALID REQUEST"));
-        assertTrue(isErrorMessage("ERROR: Translation failed"));
-        assertTrue(isErrorMessage("Cannot translate this text"));
-        assertFalse(isErrorMessage("Hello world"));
-    }
-
-    @Test
-    @DisplayName("Текст на целевом языке не переводится")
-    void testSameLanguageNoTranslation() {
-        // Пропускаем тест, требующий Minecraft
-        assertTrue(true, "Тест требует Minecraft runtime");
-    }
-
-    // Вспомогательный метод для тестирования isErrorMessage
-    private boolean isErrorMessage(String text) {
-        if (text == null || text.isEmpty()) return true;
-        String lower = text.toLowerCase();
-        return lower.contains("invalid") ||
-                lower.contains("error") ||
-                lower.contains("cannot translate") ||
-                lower.contains("too many requests") ||
-                lower.contains("rate limit");
+        assertTrue(chunks.size() > 1);
+        assertTrue(chunks.stream().allMatch(chunk -> chunk.length() <= 4_000));
+        assertEquals(text, String.join(" ", chunks));
     }
 }

@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -127,5 +129,28 @@ public class TranslationCacheTest {
         }
 
         assertTrue(smallCache.size() <= 5, "Размер кэша не должен превышать максимум");
+    }
+
+    @Test
+    void cacheCanBeResizedAtRuntime() {
+        TranslationManager.TranslationCache smallCache = new TranslationManager.TranslationCache(3);
+        smallCache.put("one", "1");
+        smallCache.put("two", "2");
+        smallCache.put("three", "3");
+
+        smallCache.resize(2);
+
+        assertEquals(2, smallCache.size());
+        assertEquals(2, smallCache.maxSize());
+        assertNull(smallCache.get("one"));
+    }
+
+    @Test
+    void snapshotIsIndependentFromLiveCache() {
+        cache.put("key", "value");
+        Map<String, String> snapshot = cache.snapshot();
+        cache.put("other", "value2");
+
+        assertEquals(Map.of("key", "value"), snapshot);
     }
 }

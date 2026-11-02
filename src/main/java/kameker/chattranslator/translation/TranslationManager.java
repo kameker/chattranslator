@@ -4,7 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import kameker.chattranslator.config.ModConfig;
-import net.minecraft.client.Minecraft;
+import net.neoforged.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,46 +19,28 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TranslationManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(TranslationManager.class);
     private static final HttpClient CLIENT = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
-    private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(4);
+    private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(4, runnable -> {
+        Thread thread = new Thread(runnable, "chattranslator-worker");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     // LRU кэш с ограничением размера
-    private static final int MAX_CACHE_SIZE = 1000;
-    private static final TranslationCache TRANSLATION_CACHE = new TranslationCache(MAX_CACHE_SIZE);
+    private static final int DEFAULT_CACHE_SIZE = 1000;
+    private static final TranslationCache TRANSLATION_CACHE = new TranslationCache(DEFAULT_CACHE_SIZE);
+    private static final AtomicBoolean CACHE_INITIALIZED = new AtomicBoolean();
 
     // Rate limiting
     private static final Map<String, RateLimiter> RATE_LIMITERS = new ConcurrentHashMap<>();
     private static final int DEFAULT_RATE_LIMIT = 50; // запросов в минуту
     private static final int DEEPL_RATE_LIMIT = 20;   // DeepL имеет более строгие лимиты
-
-    // Файл кэша
-    private static final Path CACHE_FILE = Minecraft.getInstance()
-            .gameDirectory.toPath()
-            .resolve("chattranslator_cache.json");
-
-    // Поддерживаемые языки и их паттерны для автоопределения
-    private static final Map<String, Pattern> LANGUAGE_PATTERNS = new HashMap<>();
-    static {
-        LANGUAGE_PATTERNS.put("ru", Pattern.compile("[а-яА-ЯёЁ]"));
-        LANGUAGE_PATTERNS.put("en", Pattern.compile("[a-zA-Z]"));
-        LANGUAGE_PATTERNS.put("da", Pattern.compile("[æøåÆØÅ]"));
-        LANGUAGE_PATTERNS.put("es", Pattern.compile("[áéíóúñü¿¡]"));
-        LANGUAGE_PATTERNS.put("fr", Pattern.compile("[àâæçéèêëîïôœùûüÿ]"));
-        LANGUAGE_PATTERNS.put("de", Pattern.compile("[äöüß]"));
-        LANGUAGE_PATTERNS.put("zh", Pattern.compile("[\\u4e00-\\u9fff]"));
-        LANGUAGE_PATTERNS.put("ja", Pattern.compile("[\\u3040-\\u30ff\\u4e00-\\u9fff]"));
-        LANGUAGE_PATTERNS.put("ko", Pattern.compile("[\\uac00-\\ud7af\\u1100-\\u11ff]"));
-        LANGUAGE_PATTERNS.put("it", Pattern.compile("[àèìòù]"));
-        LANGUAGE_PATTERNS.put("pt", Pattern.compile("[ãõçáéíóú]"));
-        LANGUAGE_PATTERNS.put("pl", Pattern.compile("[ąćęłńóśźż]"));
-        LANGUAGE_PATTERNS.put("uk", Pattern.compile("[ієїґ]"));
-    }
 
     // Приоритет сервисов для fallback
     private static final List<String> SERVICE_PRIORITY = Arrays.asList(
@@ -73,96 +55,87 @@ public class TranslationManager {
         RATE_LIMITERS.put("yandex", new RateLimiter(DEFAULT_RATE_LIMIT, 60));
         RATE_LIMITERS.put("deepl", new RateLimiter(DEEPL_RATE_LIMIT, 60));
 
-        // Загрузка кэша из файла
-        loadCacheFromFile();
+    }
 
-        // Периодическое сохранение кэша
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(
-                TranslationManager::saveCacheToFile,
-                5, 5, TimeUnit.MINUTES
-        );
+    public record TranslationRequest(String text, String sourceLanguage, String targetLanguage) {
+        public TranslationRequest {
+            if (targetLanguage == null || targetLanguage.isBlank()) {
+                throw new IllegalArgumentException("Target language must not be blank");
+            }
+        }
     }
 
     /**
      * Основной метод перевода с fallback между сервисами
      */
-    public static CompletableFuture<String> translate(String text, String targetLang, String sourceLang) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                if (text == null || text.trim().isEmpty()) {
-                    return text;
-                }
+    public static CompletableFuture<String> translate(TranslationRequest request) {
+        Objects.requireNonNull(request, "request");
+        return CompletableFuture.supplyAsync(() -> translateSync(
+                request.text(), request.sourceLanguage(), request.targetLanguage()), EXECUTOR);
+    }
 
-                // Разбиение длинных сообщений
-                if (text.length() > 4000) {
-                    return translateLongText(text, targetLang, sourceLang);
-                }
-
-                // Проверяем кэш
-                String cacheKey = text + "|" + targetLang + "|" + sourceLang;
-                String cached = TRANSLATION_CACHE.get(cacheKey);
-                if (cached != null) {
-                    LOGGER.debug("Cache hit: {}", cacheKey);
-                    return cached;
-                }
-
-                // Определяем исходный язык, если нужно
-                String detectedSource = sourceLang;
-                if (detectedSource == null || ModConfig.AUTO_DETECT_SOURCE.get()) {
-                    detectedSource = detectLanguage(text);
-                    LOGGER.debug("Detected source language: {}", detectedSource);
-                }
-
-                // Если текст уже на целевом языке, не переводим
-                if (detectedSource.equals(targetLang)) {
-                    LOGGER.debug("Text already in target language");
-                    return text;
-                }
-
-                // Пробуем перевести с приоритетом сервисов
-                String translated = translateWithFallback(text, detectedSource, targetLang);
-
-                if (translated != null && !translated.equals(text) && !isErrorMessage(translated)) {
-                    translated = translated.replace("+", " ");
-                    TRANSLATION_CACHE.put(cacheKey, translated);
-                    LOGGER.info("Translated [{}->{}]: {} -> {}",
-                            detectedSource, targetLang, text, translated);
-                    return translated;
-                }
-
-                return text;
-
-            } catch (Exception e) {
-                LOGGER.error("Translation error: {}", e.getMessage(), e);
+    static String translateSync(String text, String sourceLang, String targetLang) {
+        try {
+            if (text == null || text.trim().isEmpty()) {
                 return text;
             }
-        }, EXECUTOR);
+            if (targetLang == null || targetLang.isBlank()) {
+                throw new IllegalArgumentException("Target language must not be blank");
+            }
+
+            ensureCacheInitialized();
+            TRANSLATION_CACHE.resize(ModConfig.CACHE_MAX_SIZE.get());
+
+            String detectedSource = sourceLang;
+            if (detectedSource == null || detectedSource.isBlank() || ModConfig.AUTO_DETECT_SOURCE.get()) {
+                detectedSource = TranslationEngine.detectLanguage(text);
+                LOGGER.debug("Detected source language: {}", detectedSource);
+            }
+
+            String cacheKey = text + "|" + detectedSource + "|" + targetLang;
+            String cached = TRANSLATION_CACHE.get(cacheKey);
+            if (cached != null) {
+                LOGGER.debug("Cache hit: {}", cacheKey);
+                return cached;
+            }
+
+            if (detectedSource.equalsIgnoreCase(targetLang)) {
+                LOGGER.debug("Text already in target language");
+                return text;
+            }
+
+            String translated = text.length() > 4000
+                    ? translateLongText(text, detectedSource, targetLang)
+                    : translateWithFallback(text, detectedSource, targetLang);
+
+            if (translated != null && !translated.equals(text) && !TranslationEngine.isErrorMessage(translated)) {
+                TRANSLATION_CACHE.put(cacheKey, translated);
+                LOGGER.info("Translated [{}->{}]: {} -> {}",
+                        detectedSource, targetLang, text, translated);
+                return translated;
+            }
+            return text;
+        } catch (Exception e) {
+            LOGGER.error("Translation error: {}", e.getMessage(), e);
+            return text;
+        }
     }
 
     /**
      * Перевод длинных текстов с разбиением на части
      */
-    private static String translateLongText(String text, String targetLang, String sourceLang) {
+    private static String translateLongText(String text, String sourceLang, String targetLang) {
         LOGGER.debug("Translating long text ({} chars)", text.length());
 
-        // Разбиваем по предложениям
-        String[] sentences = text.split("(?<=[.!?])\\s+");
         StringBuilder result = new StringBuilder();
 
-        for (String sentence : sentences) {
-            if (sentence.trim().isEmpty()) continue;
-
-            String translated = translate(sentence, targetLang, sourceLang).join();
-            result.append(translated).append(" ");
-
-            // Небольшая пауза для rate limiting
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+        for (String chunk : TranslationEngine.splitText(text, 4000)) {
+            String translated = translateWithFallback(chunk, sourceLang, targetLang);
+            if (translated == null) {
+                translated = chunk;
             }
+            if (!result.isEmpty()) result.append(' ');
+            result.append(translated);
         }
 
         return result.toString().trim();
@@ -173,71 +146,34 @@ public class TranslationManager {
      */
     private static String translateWithFallback(String text, String sourceLang, String targetLang) {
         String preferredService = ModConfig.TRANSLATION_SERVICE.get();
-        List<String> servicesToTry = new ArrayList<>();
-
-        // Сначала пробуем предпочтительный сервис
-        servicesToTry.add(preferredService);
-
-        // Затем остальные по приоритету
-        for (String service : SERVICE_PRIORITY) {
-            if (!servicesToTry.contains(service)) {
-                servicesToTry.add(service);
-            }
-        }
-
-        for (String service : servicesToTry) {
-            try {
-                // Проверяем rate limit
-                if (!RATE_LIMITERS.get(service).tryAcquire()) {
-                    LOGGER.debug("Rate limit exceeded for {}", service);
-                    continue;
-                }
-
-                String translated = switch (service) {
-                    case "yandex" -> translateWithYandex(text, sourceLang, targetLang);
-                    case "deepl" -> translateWithDeepL(text, sourceLang, targetLang);
-                    case "libre" -> translateWithLibre(text, sourceLang, targetLang);
-                    case "lingva" -> translateWithLingva(text, targetLang);
-                    case "mymemory" -> translateWithMyMemory(text, sourceLang, targetLang);
-                    default -> null;
-                };
-
-                if (translated != null && !isErrorMessage(translated)) {
-                    LOGGER.debug("Successfully translated with {}", service);
-                    return translated;
-                }
-            } catch (Exception e) {
-                LOGGER.debug("Service {} failed: {}", service, e.getMessage());
-            }
-        }
-
-        LOGGER.warn("All translation services failed");
-        return null;
+        return translateWithFallback(text, sourceLang, targetLang, preferredService,
+                createBuiltInServices(), SERVICE_PRIORITY, RATE_LIMITERS);
     }
 
-    private static String detectLanguage(String text) {
-        Map<String, Integer> scores = new HashMap<>();
+    static String translateWithFallback(String text, String sourceLang, String targetLang,
+                                        String preferredService,
+                                        Map<String, TranslationEngine.Service> services,
+                                        List<String> priority,
+                                        Map<String, RateLimiter> rateLimiters) {
+        String translated = TranslationEngine.translateWithFallback(
+                text, sourceLang, targetLang, preferredService, services, priority, service -> {
+                    RateLimiter limiter = rateLimiters.get(service);
+                    boolean allowed = limiter == null || limiter.tryAcquire();
+                    if (!allowed) LOGGER.debug("Rate limit exceeded for {}", service);
+                    return allowed;
+                });
+        if (translated == null) LOGGER.warn("All translation services failed");
+        return translated;
+    }
 
-        for (Map.Entry<String, Pattern> entry : LANGUAGE_PATTERNS.entrySet()) {
-            int count = 0;
-            var matcher = entry.getValue().matcher(text);
-            while (matcher.find()) {
-                count++;
-            }
-            if (count > 0) {
-                scores.put(entry.getKey(), count);
-            }
-        }
-
-        if (scores.isEmpty()) {
-            return "en";
-        }
-
-        // Возвращаем язык с наибольшим количеством совпадений
-        return scores.entrySet().stream()
-                .max(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey)
-                .orElse("en");
+    private static Map<String, TranslationEngine.Service> createBuiltInServices() {
+        Map<String, TranslationEngine.Service> services = new HashMap<>();
+        services.put("yandex", TranslationManager::translateWithYandex);
+        services.put("deepl", TranslationManager::translateWithDeepL);
+        services.put("libre", TranslationManager::translateWithLibre);
+        services.put("lingva", (text, source, target) -> translateWithLingva(text, target));
+        services.put("mymemory", TranslationManager::translateWithMyMemory);
+        return services;
     }
 
     private static String translateWithMyMemory(String text, String sourceLang, String targetLang) {
@@ -466,30 +402,19 @@ public class TranslationManager {
         }
     }
 
-    private static boolean isErrorMessage(String text) {
-        if (text == null || text.isEmpty()) return true;
-
-        String lower = text.toLowerCase();
-        return lower.contains("invalid") ||
-                lower.contains("error") ||
-                lower.contains("cannot translate") ||
-                lower.contains("too many requests") ||
-                lower.contains("rate limit") ||
-                text.matches(".*\\b(error|failed)\\b.*");
-    }
-
     /**
      * Загрузка кэша из файла
      */
     private static void loadCacheFromFile() {
         try {
-            File cacheFile = CACHE_FILE.toFile();
+            Path cachePath = getCacheFile();
+            File cacheFile = cachePath.toFile();
             if (!cacheFile.exists()) {
                 LOGGER.debug("Cache file does not exist, starting fresh");
                 return;
             }
 
-            String json = new String(java.nio.file.Files.readAllBytes(CACHE_FILE), StandardCharsets.UTF_8);
+            String json = new String(java.nio.file.Files.readAllBytes(cachePath), StandardCharsets.UTF_8);
             JsonObject root = JsonParser.parseString(json).getAsJsonObject();
 
             if (root.has("translations")) {
@@ -513,7 +438,7 @@ public class TranslationManager {
             JsonObject root = new JsonObject();
             JsonObject translations = new JsonObject();
 
-            for (Map.Entry<String, String> entry : TRANSLATION_CACHE.entrySet()) {
+            for (Map.Entry<String, String> entry : TRANSLATION_CACHE.snapshot().entrySet()) {
                 translations.addProperty(entry.getKey(), entry.getValue());
             }
 
@@ -522,13 +447,28 @@ public class TranslationManager {
             root.addProperty("timestamp", System.currentTimeMillis());
 
             String json = root.toString();
-            java.nio.file.Files.writeString(CACHE_FILE, json, StandardCharsets.UTF_8);
+            java.nio.file.Files.writeString(getCacheFile(), json, StandardCharsets.UTF_8);
 
             LOGGER.debug("Saved {} translations to cache file", TRANSLATION_CACHE.size());
 
         } catch (Exception e) {
             LOGGER.warn("Failed to save cache to file: {}", e.getMessage());
         }
+    }
+
+    private static Path getCacheFile() {
+        return FMLPaths.GAMEDIR.get().resolve("chattranslator_cache.json");
+    }
+
+    private static void ensureCacheInitialized() {
+        if (!CACHE_INITIALIZED.compareAndSet(false, true)) return;
+        loadCacheFromFile();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "chattranslator-cache");
+            thread.setDaemon(true);
+            return thread;
+        });
+        scheduler.scheduleAtFixedRate(TranslationManager::saveCacheToFile, 5, 5, TimeUnit.MINUTES);
     }
 
     /**
@@ -546,7 +486,7 @@ public class TranslationManager {
     public static Map<String, Object> getCacheStats() {
         Map<String, Object> stats = new HashMap<>();
         stats.put("size", TRANSLATION_CACHE.size());
-        stats.put("maxSize", MAX_CACHE_SIZE);
+        stats.put("maxSize", TRANSLATION_CACHE.maxSize());
         stats.put("hitRate", TRANSLATION_CACHE.getHitRate());
         return stats;
     }
@@ -556,7 +496,7 @@ public class TranslationManager {
      */
     static class TranslationCache {
         private final LinkedHashMap<String, String> cache;
-        private final int maxSize;
+        private int maxSize;
         private int hits = 0;
         private int misses = 0;
 
@@ -584,6 +524,20 @@ public class TranslationManager {
             cache.put(key, value);
         }
 
+        public synchronized void resize(int newMaxSize) {
+            if (newMaxSize <= 0) throw new IllegalArgumentException("Cache size must be positive");
+            maxSize = newMaxSize;
+            while (cache.size() > maxSize) {
+                Iterator<String> iterator = cache.keySet().iterator();
+                iterator.next();
+                iterator.remove();
+            }
+        }
+
+        public synchronized int maxSize() {
+            return maxSize;
+        }
+
         public synchronized double getHitRate() {
             int total = hits + misses;
             if (total == 0) return 0.0;
@@ -600,8 +554,8 @@ public class TranslationManager {
             misses = 0;
         }
 
-        public synchronized Set<Map.Entry<String, String>> entrySet() {
-            return cache.entrySet();
+        public synchronized Map<String, String> snapshot() {
+            return new LinkedHashMap<>(cache);
         }
     }
 

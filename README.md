@@ -39,7 +39,7 @@
 Или используйте команду в чате (если есть поддержка Mod Menu)
 
 ### Через файл конфигурации
-Файл: `.minecraft/config/chattranslator.toml`
+Файл: `.minecraft/config/chattranslator-client.toml`
 
 ### Основные настройки
 

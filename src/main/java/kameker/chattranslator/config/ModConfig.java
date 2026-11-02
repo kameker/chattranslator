@@ -2,16 +2,11 @@ package kameker.chattranslator.config;
 
 import net.neoforged.neoforge.common.ModConfigSpec;
 import net.neoforged.fml.event.config.ModConfigEvent;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import kameker.chattranslator.Chattranslator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
-import java.util.ArrayList;
 
-@EventBusSubscriber(modid = Chattranslator.MODID, bus = EventBusSubscriber.Bus.MOD)
 public class ModConfig {
     private static final Logger LOGGER = LoggerFactory.getLogger(ModConfig.class);
 
@@ -184,13 +179,11 @@ public class ModConfig {
 
     public static final ModConfigSpec SPEC;
 
-    @SubscribeEvent
     public static void onConfigLoad(ModConfigEvent.Loading event) {
         LOGGER.info("Chat Translator config loaded");
         logConfig();
     }
 
-    @SubscribeEvent
     public static void onConfigReload(ModConfigEvent.Reloading event) {
         LOGGER.info("Chat Translator config reloaded");
         logConfig();
@@ -211,14 +204,15 @@ public class ModConfig {
      * Проверка, находится ли игрок в списке для перевода
      */
     public static boolean shouldTranslatePlayer(String playerName) {
-        if (playerName == null || playerName.isEmpty()) {
-            return true;
-        }
+        return PlayerRules.shouldTranslate(playerName, USE_WHITELIST_MODE.get(),
+                WHITELISTED_PLAYERS.get(), BLACKLISTED_PLAYERS.get());
+    }
 
-        if (USE_WHITELIST_MODE.get()) {
-            return WHITELISTED_PLAYERS.get().contains(playerName);
-        } else {
-            return !BLACKLISTED_PLAYERS.get().contains(playerName);
-        }
+    public static List<String> parsePlayerList(String input) {
+        return PlayerRules.parseList(input);
+    }
+
+    public static void save() {
+        SPEC.save();
     }
 }

@@ -18,15 +18,13 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @EventBusSubscriber(modid = Chattranslator.MODID, value = Dist.CLIENT)
 public class ChatHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger(ChatHandler.class);
-    private static final Map<String, Long> PROCESSED_MESSAGES = new ConcurrentHashMap<>();
-    private static boolean isProcessing = false;
+    private static final MessageDeduplicator PROCESSED_MESSAGES = new MessageDeduplicator();
     private static String lastSentMessage = "";
     private static String lastSentTranslation = "";
 
@@ -70,19 +68,16 @@ public class ChatHandler {
         }
 
         if (!isTranslationEnabled()) return;
-        if (isProcessing) return;
         if (!ModConfig.ENABLE_TRANSLATION.get() || !ModConfig.TRANSLATE_OUTGOING.get()) return;
 
         if (message.startsWith("/") || message.startsWith("!")) return;
 
         // Проверяем дубликаты
-        String messageHash = message + System.currentTimeMillis() / 1000;
-        if (PROCESSED_MESSAGES.containsKey(messageHash)) return;
+        String messageHash = "outgoing|" + message;
+        if (!markAsProcessing(messageHash)) return;
 
         lastSentMessage = message;
-        PROCESSED_MESSAGES.put(messageHash, System.currentTimeMillis());
         event.setCanceled(true);
-        isProcessing = true;
 
         try {
             String sourceLang = ModConfig.SOURCE_LANGUAGE.get();
@@ -90,7 +85,8 @@ public class ChatHandler {
 
             LOGGER.debug("Outgoing translation: {} -> {}", sourceLang, targetLang);
 
-            TranslationManager.translate(message, targetLang, sourceLang)
+            TranslationManager.translate(new TranslationManager.TranslationRequest(
+                            message, sourceLang, targetLang))
                     .thenAccept(translated -> {
                         Minecraft.getInstance().execute(() -> {
                             try {
@@ -103,14 +99,12 @@ public class ChatHandler {
                                     TRANSLATION_HISTORY.add(message, translated, true);
                                 }
                             } finally {
-                                isProcessing = false;
                                 cleanProcessedMessages();
                             }
                         });
                     })
                     .exceptionally(e -> {
                         LOGGER.error("Translation failed: {}", e.getMessage());
-                        isProcessing = false;
                         Minecraft.getInstance().execute(() -> {
                             if (Minecraft.getInstance().player != null) {
                                 Minecraft.getInstance().player.connection.sendChat(message);
@@ -120,14 +114,13 @@ public class ChatHandler {
                     });
         } catch (Exception e) {
             LOGGER.error("Error in chat handler: {}", e.getMessage());
-            isProcessing = false;
+            PROCESSED_MESSAGES.remove(messageHash);
         }
     }
 
     @SubscribeEvent
     public static void onChatReceived(ClientChatReceivedEvent event) {
         if (!isTranslationEnabled()) return;
-        if (isProcessing) return;
         if (!ModConfig.ENABLE_TRANSLATION.get() || !ModConfig.TRANSLATE_INCOMING.get()) return;
 
         Component originalComponent = event.getMessage();
@@ -139,6 +132,11 @@ public class ChatHandler {
 
         // Извлекаем имя игрока
         String playerName = extractPlayerName(fullMessage);
+
+        if (playerName != null && Minecraft.getInstance().player != null
+                && playerName.equalsIgnoreCase(Minecraft.getInstance().player.getName().getString())) {
+            return;
+        }
 
         // Проверяем фильтры игроков
         if (playerName != null && !ModConfig.shouldTranslatePlayer(playerName)) {
@@ -163,14 +161,11 @@ public class ChatHandler {
         }
 
         // Проверяем дубликаты
-        String messageHash = fullMessage + System.currentTimeMillis() / 1000;
-        if (PROCESSED_MESSAGES.containsKey(messageHash)) {
+        String messageHash = "incoming|" + fullMessage;
+        if (!markAsProcessing(messageHash)) {
             LOGGER.debug("Сообщение уже обработано");
             return;
         }
-
-        PROCESSED_MESSAGES.put(messageHash, System.currentTimeMillis());
-        isProcessing = true;
 
         try {
             // Разделяем префикс и текст
@@ -181,7 +176,8 @@ public class ChatHandler {
             String sourceLang = ModConfig.SOURCE_LANGUAGE.get();
             String targetLang = ModConfig.TARGET_LANGUAGE.get();
 
-            TranslationManager.translate(textToTranslate, sourceLang, targetLang)
+            TranslationManager.translate(new TranslationManager.TranslationRequest(
+                            textToTranslate, sourceLang, targetLang))
                     .thenAcceptAsync(translated -> {
                         Minecraft.getInstance().execute(() -> {
                             try {
@@ -200,7 +196,10 @@ public class ChatHandler {
                                     Component translatedMessage = createTranslationComponent(
                                             finalTranslated,
                                             textToTranslate,
-                                            ModConfig.SHOW_ORIGINAL.get()
+                                            ModConfig.SHOW_ORIGINAL.get(),
+                                            ModConfig.SHOW_TRANSLATION_HINT.get(),
+                                            ModConfig.AUTO_DETECT_SOURCE.get() ? "auto" : sourceLang,
+                                            targetLang
                                     );
 
                                     Minecraft.getInstance().player.sendSystemMessage(translatedMessage);
@@ -210,20 +209,19 @@ public class ChatHandler {
                                 }
 
                             } finally {
-                                isProcessing = false;
                                 cleanProcessedMessages();
                             }
                         });
                     }, Minecraft.getInstance())
                     .exceptionally(e -> {
                         LOGGER.error("Translation error: {}", e.getMessage());
-                        isProcessing = false;
+                        PROCESSED_MESSAGES.remove(messageHash);
                         return null;
                     });
 
         } catch (Exception e) {
             LOGGER.error("Error in chat handler: {}", e.getMessage());
-            isProcessing = false;
+            PROCESSED_MESSAGES.remove(messageHash);
         }
     }
 
@@ -337,11 +335,16 @@ public class ChatHandler {
         return null;
     }
 
-    private static Component createTranslationComponent(String translated, String original, boolean showOriginal) {
+    private static Component createTranslationComponent(String translated, String original, boolean showOriginal,
+                                                        boolean showHint, String sourceLang, String targetLang) {
         StringBuilder result = new StringBuilder();
 
         // Добавляем префикс
-        result.append("[Перевод] ");
+        result.append("[Перевод");
+        if (showHint) {
+            result.append(" ").append(sourceLang).append("→").append(targetLang);
+        }
+        result.append("] ");
 
         // Добавляем перевод
         result.append(translated);
@@ -350,7 +353,10 @@ public class ChatHandler {
 
         // Если нужно, добавляем тултип с оригиналом
         if (showOriginal && !original.equals(translated)) {
-            message = Component.literal("[Перевод] ")
+            String prefix = showHint
+                    ? "[Перевод " + sourceLang + "→" + targetLang + "] "
+                    : "[Перевод] ";
+            message = Component.literal(prefix)
                     .withStyle(ChatFormatting.RED, ChatFormatting.BOLD)
                     .append(Component.literal(translated).withStyle(ChatFormatting.WHITE)
                             .setStyle(Component.literal(original).getStyle()
@@ -400,9 +406,13 @@ public class ChatHandler {
 
     private static void cleanProcessedMessages() {
         long timeout = ModConfig.MESSAGE_TIMEOUT.get();
-        long now = System.currentTimeMillis();
-        PROCESSED_MESSAGES.entrySet().removeIf(entry ->
-                now - entry.getValue() > timeout);
+        PROCESSED_MESSAGES.clean(System.currentTimeMillis(), timeout);
+    }
+
+    static boolean markAsProcessing(String messageHash) {
+        long timeout = ModConfig.MESSAGE_TIMEOUT.get();
+        cleanProcessedMessages();
+        return PROCESSED_MESSAGES.markIfNew(messageHash, System.currentTimeMillis(), timeout);
     }
 
     /**

@@ -1,4 +1,19 @@
-# Project exclude paths
+# Gradle
 /.gradle/
 /build/
-/build/classes/java/main/
+/src/generated/
+
+# IDEs
+/.idea/
+/.eclipse/
+/.vscode/
+*.iml
+
+# Local Minecraft runtime (worlds, logs, configs and credentials)
+/run/
+
+# Local secrets and caches
+chattranslator_cache.json
+*.log
+*.log.gz
+*.bak

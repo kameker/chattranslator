@@ -1,13 +1,13 @@
 package kameker.chattranslator.client;
 
 import kameker.chattranslator.config.ModConfig;
+import kameker.chattranslator.config.PlayerRules;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.components.*;
 import net.minecraft.network.chat.Component;
 import net.minecraft.ChatFormatting;
 
 import java.util.List;
-import java.util.ArrayList;
 
 public class ConfigScreen extends Screen {
     private final Screen parent;
@@ -37,7 +37,8 @@ public class ConfigScreen extends Screen {
     private Checkbox altModifierCheckbox;
     private EditBox hotkeyField;
 
-    private int scrollY = 0;
+    private int scrollOffset = 0;
+    private int contentHeight = 0;
     private static final int SCROLL_SPEED = 20;
 
     public ConfigScreen(Screen parent) {
@@ -48,7 +49,7 @@ public class ConfigScreen extends Screen {
     @Override
     protected void init() {
         super.init();
-        scrollY = 0;
+        scrollOffset = 0;
         createAllSettings();
     }
 
@@ -256,6 +257,7 @@ public class ConfigScreen extends Screen {
                 Component.literal("Cancel"),
                 button -> onClose()
         ).bounds(centerX + 110, y, 100, 20).build());
+        contentHeight = y + 30;
     }
 
     private void addSectionTitle(String title, int x, int y) {
@@ -283,15 +285,18 @@ public class ConfigScreen extends Screen {
         ModConfig.SHOW_TRANSLATION_HINT.set(showHintCheckbox.selected());
 
         try {
-            ModConfig.CACHE_MAX_SIZE.set(Integer.parseInt(cacheSizeField.getValue().isEmpty() ? "1000" : cacheSizeField.getValue()));
+            int cacheSize = Integer.parseInt(cacheSizeField.getValue().isEmpty() ? "1000" : cacheSizeField.getValue());
+            ModConfig.CACHE_MAX_SIZE.set(Math.max(100, Math.min(10000, cacheSize)));
         } catch (NumberFormatException e) {
             ModConfig.CACHE_MAX_SIZE.set(1000);
         }
 
         // Языки
         ModConfig.AUTO_DETECT_SOURCE.set(autoDetectCheckbox.selected());
-        ModConfig.SOURCE_LANGUAGE.set(sourceLanguageField.getValue().isEmpty() ? "en" : sourceLanguageField.getValue());
-        ModConfig.TARGET_LANGUAGE.set(targetLanguageField.getValue().isEmpty() ? "ru" : targetLanguageField.getValue());
+        ModConfig.SOURCE_LANGUAGE.set(sourceLanguageField.getValue().isEmpty()
+                ? "en" : sourceLanguageField.getValue().toLowerCase(java.util.Locale.ROOT));
+        ModConfig.TARGET_LANGUAGE.set(targetLanguageField.getValue().isEmpty()
+                ? "ru" : targetLanguageField.getValue().toLowerCase(java.util.Locale.ROOT));
 
         // Сервисы
         ModConfig.TRANSLATION_SERVICE.set(serviceButton.getValue());
@@ -301,14 +306,13 @@ public class ConfigScreen extends Screen {
 
         // Фильтры
         ModConfig.USE_WHITELIST_MODE.set(whitelistModeButton.getValue().equals("true"));
-        ModConfig.BLACKLISTED_PLAYERS.set(parsePlayerList(blacklistField.getValue()));
-        ModConfig.WHITELISTED_PLAYERS.set(parsePlayerList(whitelistField.getValue()));
+        ModConfig.BLACKLISTED_PLAYERS.set(PlayerRules.parseList(blacklistField.getValue()));
+        ModConfig.WHITELISTED_PLAYERS.set(PlayerRules.parseList(whitelistField.getValue()));
 
         // Горячие клавиши
         try {
-            ModConfig.HOTKEY_TOGGLE_TRANSLATION.set(
-                    Integer.parseInt(hotkeyField.getValue().isEmpty() ? "0" : hotkeyField.getValue())
-            );
+            int hotkey = Integer.parseInt(hotkeyField.getValue().isEmpty() ? "0" : hotkeyField.getValue());
+            ModConfig.HOTKEY_TOGGLE_TRANSLATION.set(Math.max(0, Math.min(350, hotkey)));
         } catch (NumberFormatException e) {
             ModConfig.HOTKEY_TOGGLE_TRANSLATION.set(0);
         }
@@ -316,30 +320,24 @@ public class ConfigScreen extends Screen {
         ModConfig.HOTKEY_MODIFIER_CTRL.set(ctrlModifierCheckbox.selected());
         ModConfig.HOTKEY_MODIFIER_ALT.set(altModifierCheckbox.selected());
 
+        ModConfig.save();
+
         onClose();
     }
 
-    private List<String> parsePlayerList(String input) {
-        if (input == null || input.trim().isEmpty()) {
-            return new ArrayList<>();
-        }
-        List<String> result = new ArrayList<>();
-        for (String name : input.split(",")) {
-            String trimmed = name.trim();
-            if (!trimmed.isEmpty()) {
-                result.add(trimmed);
-            }
-        }
-        return result;
-    }
-
     @Override
-    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
-        // Прокрутка для длинного списка настроек
-        if (scrollY > 0) {
-            scrollY = Math.min(0, scrollY + SCROLL_SPEED);
-        } else {
-            scrollY = Math.max(-200, scrollY - SCROLL_SPEED);
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollDelta) {
+        int minOffset = Math.min(0, height - contentHeight - 10);
+        int oldOffset = scrollOffset;
+        scrollOffset = Math.max(minOffset, Math.min(0,
+                scrollOffset + (int) Math.signum(scrollDelta) * SCROLL_SPEED));
+        int movement = scrollOffset - oldOffset;
+        if (movement != 0) {
+            children().forEach(child -> {
+                if (child instanceof AbstractWidget widget) {
+                    widget.setY(widget.getY() + movement);
+                }
+            });
         }
         return true;
     }
